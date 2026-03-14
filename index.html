@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LF2 復刻專案 - ✨ AI 動態台詞升級版 (含劍氣、敵人AI與衝刺)</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #1a1a1a;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        #game-container {
+            box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+            border-radius: 8px;
+            overflow: hidden;
+            position: relative;
+        }
+        #ui-panel {
+            margin-top: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 15px 25px;
+            border-radius: 10px;
+            text-align: center;
+            line-height: 1.8;
+        }
+        .key {
+            background: #f39c12;
+            color: #000;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            margin: 0 5px;
+        }
+    </style>
+    <!-- 載入 Phaser.js 遊戲引擎 -->
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+</head>
+<body>
+
+<div id="game-container"></div>
+<div id="ui-panel">
+    操作指南：<span class="key">方向鍵</span> 移動 (<span class="key">雙擊方向</span> 可衝刺) | <span class="key">A</span> 攻擊 | <span class="key">F</span> 劍氣 | <span class="key">S</span> 跳躍 | <span class="key">D</span> 防禦 <br>
+    <strong>AI 互動：</strong> 按下 <span class="key">T</span> 鍵觸發 <strong>✨ 魏武帝的霸氣語錄</strong> (Gemini API)
+</div>
+
+<script>
+    // --- Gemini API 整合設定 ---
+    const apiKey = ""; // 執行環境會自動提供 API Key
+
+    // 指數退避重試機制的 API 呼叫函數
+    async function callGeminiAPI(prompt, retries = 5) {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+        const payload = {
+            contents: [{ parts: [{ text: prompt }] }]
+        };
+        const delays = [1000, 2000, 4000, 8000, 16000];
+
+        for (let i = 0; i < retries; i++) {
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                if (!response.ok) throw new Error(`HTTP 錯誤! 狀態碼: ${response.status}`);
+                
+                const data = await response.json();
+                return data.candidates[0].content.parts[0].text.trim();
+            } catch (error) {
+                if (i === retries - 1) {
+                    return "（天機不可洩漏... 似乎連不上天命）";
+                }
+                await new Promise(resolve => setTimeout(resolve, delays[i]));
+            }
+        }
+    }
+
+    // --- 遊戲主要場景 ---
+    class MainScene extends Phaser.Scene {
+        constructor() {
+            super({ key: 'MainScene' });
+        }
+
+        preload() {
+            let graphics = this.add.graphics();
+            graphics.fillStyle(0xf1c40f, 0.6);
+            graphics.fillRect(0, 0, 80, 60);
+            graphics.generateTexture('hitbox_tex', 80, 60);
+            
+            graphics.clear();
+            graphics.fillStyle(0xe74c3c, 1);
+            graphics.fillRect(0, 0, 50, 100);
+            graphics.generateTexture('enemy_tex', 50, 100);
+            
+            graphics.clear();
+            graphics.fillStyle(0xffa500, 0.9);
+            graphics.fillEllipse(30, 20, 60, 40); 
+            graphics.generateTexture('aura_tex', 60, 40);
+            graphics.destroy();
+            
+            // 注意：因為目前在 Sandbox 環境測試，直接用 this.load.spritesheet 載入本地檔案會引發 CORS XHR 錯誤
+            // 所以我在下面的 create 函數中，再次換回了 DOM Image 的動態載入方式來修復 Invalid URL 報錯。
+        }
+
+        create() {
+            this.isReady = false; 
+
+            // --- 環境設置 ---
+            this.worldWidth = 2400; 
+            this.ground = this.add.rectangle(this.worldWidth / 2, 580, this.worldWidth, 40, 0x2c3e50);
+            this.physics.add.existing(this.ground, true);
+
+            for (let i = 200; i < this.worldWidth; i += 400) {
+                this.add.rectangle(i, 450, 60, 220, 0x34495e).setDepth(-1); 
+            }
+
+            // 🌟 解決 Sandbox 環境中 XMLHttpRequest Invalid URL 的問題，改回 DOM Image 載入
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            
+            img.onload = () => {
+                this.textures.addSpriteSheet('cao_cao', img, { 
+                    frameWidth: 146, 
+                    frameHeight: 204 
+                });
+                this.initGameObjects(); 
+            };
+            
+            img.onerror = () => {
+                console.warn("無法載入本地圖片，將啟用備用材質進行測試。");
+                const canvas = document.createElement('canvas');
+                canvas.width = 146 * 7; 
+                canvas.height = 204 * 5; 
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#3498db';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.strokeStyle = '#2980b9';
+                for(let x=0; x<=canvas.width; x+=146) {
+                    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+                }
+                for(let y=0; y<=canvas.height; y+=204) {
+                    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+                }
+                this.textures.addSpriteSheet('cao_cao', canvas, { frameWidth: 146, frameHeight: 204 });
+                this.initGameObjects();
+            };
+            
+            // 使用之前上傳的精靈圖名稱
+            img.src = '/imges/caocao.png';
+        }
+
+        initGameObjects() {
+            // --- 建立動畫 ---
+            this.anims.create({
+                key: 'idle',
+                frames: this.anims.generateFrameNumbers('cao_cao', { start: 7, end: 7 }),
+                frameRate: 5, repeat: -1
+            });
+
+            this.anims.create({
+                key: 'run',
+                frames: this.anims.generateFrameNumbers('cao_cao', { start: 7, end: 12 }),
+                frameRate: 10, repeat: -1
+            });
+
+            this.anims.create({
+                key: 'attack',
+                frames: this.anims.generateFrameNumbers('cao_cao', { start: 21, end: 25 }),
+                frameRate: 15, repeat: 0
+            });
+
+            // --- 玩家設置 ---
+            this.player = this.physics.add.sprite(400, 300, 'cao_cao');
+            this.player.setScale(0.8); 
+            this.player.body.setSize(60, 120); 
+            this.player.body.setOffset(45, 80); 
+            this.player.setCollideWorldBounds(true);
+            this.player.setBounce(0);
+            this.physics.add.collider(this.player, this.ground);
+
+            this.physics.world.setBounds(0, 0, this.worldWidth, 600);
+            this.cameras.main.setBounds(0, 0, this.worldWidth, 600);
+            this.cameras.main.startFollow(this.player, true, 0.1, 0.1);
+
+            this.player.customState = 'IDLE';
+            this.player.facing = 'right';
+            this.player.anims.play('idle');
+
+            // 🌟 雙擊衝刺用的時間變數
+            this.lastRightDownTime = 0;
+            this.lastLeftDownTime = 0;
+            this.doubleTapThreshold = 250; // 雙擊判定時間差 (毫秒)，越小越需要快按
+
+            // --- 敵人設置 ---
+            this.enemy = this.physics.add.sprite(600, 300, 'enemy_tex');
+            this.enemy.setCollideWorldBounds(true);
+            this.physics.add.collider(this.enemy, this.ground);
+            this.enemy.customState = 'IDLE';
+            this.enemy.hp = 100;
+            
+            this.enemyHpText = this.add.text(600, 230, 'HP: 100', { 
+                fill: '#ff0000', fontSize: '16px', fontWeight: 'bold' 
+            }).setOrigin(0.5);
+
+            // --- 攻擊判定框 & 劍氣 ---
+            this.attackHitbox = this.physics.add.sprite(0, 0, 'hitbox_tex');
+            this.attackHitbox.setVisible(false);
+            this.attackHitbox.body.setAllowGravity(false);
+            this.attackHitbox.body.setEnable(false);
+
+            this.auras = this.physics.add.group({ allowGravity: false });
+
+            this.physics.add.overlap(this.attackHitbox, this.enemy, this.handleMeleeHit, null, this);
+            this.physics.add.overlap(this.auras, this.enemy, this.handleAuraHit, null, this);
+
+            // --- UI 系統 ---
+            this.bubbleContainer = this.add.container(0, 0).setVisible(false);
+            this.bubbleContainer.setDepth(100);
+            this.bubbleBg = this.add.graphics();
+            this.bubbleText = this.add.text(0, 0, '', { 
+                fontSize: '16px', fill: '#2c3e50', fontFamily: '微軟正黑體, Arial', fontStyle: 'bold'
+            }).setOrigin(0.5, 0.5);
+            this.bubbleContainer.add([this.bubbleBg, this.bubbleText]);
+            this.isTaunting = false;
+
+            // --- 輸入按鍵設置 ---
+            this.cursors = this.input.keyboard.createCursorKeys();
+            this.keys = this.input.keyboard.addKeys({
+                attack: Phaser.Input.Keyboard.KeyCodes.A,
+                skill: Phaser.Input.Keyboard.KeyCodes.F, 
+                dash: Phaser.Input.Keyboard.KeyCodes.C,
+                jump: Phaser.Input.Keyboard.KeyCodes.S,
+                defend: Phaser.Input.Keyboard.KeyCodes.D,
+                taunt: Phaser.Input.Keyboard.KeyCodes.T 
+            });
+
+            this.isReady = true; 
+            console.log("遊戲開始！按下 C 鍵試試帶有殘影的衝刺吧！");
+        }
+
+        update() {
+            if (!this.isReady) return;
+            
+            this.handlePlayerInput();
+            this.updateHitboxPosition();
+            this.updateBubblePosition(); 
+            this.updateEnemyAI();
+
+            if (this.enemy && this.enemy.active) {
+                this.enemyHpText.setPosition(this.enemy.x, this.enemy.y - 70);
+            }
+        }
+
+        updateEnemyAI() {
+            if (!this.enemy || !this.enemy.active || this.enemy.hp <= 0) return;
+            if (this.enemy.customState === 'HURT') return;
+
+            let dx = this.player.x - this.enemy.x;
+            let distance = Math.abs(dx);
+
+            if (distance > 70) {
+                this.enemy.customState = 'RUN';
+                if (dx > 0) {
+                    this.enemy.setVelocityX(90); 
+                } else {
+                    this.enemy.setVelocityX(-90);
+                }
+            } else {
+                this.enemy.customState = 'IDLE';
+                this.enemy.setVelocityX(0);
+            }
+        }
+
+        handlePlayerInput() {
+            if (Phaser.Input.Keyboard.JustDown(this.keys.taunt)) {
+                this.triggerGeminiTaunt();
+            }
+
+            if (this.player.customState === 'ATTACK' || this.player.customState === 'DASH') return;
+
+            if (this.keys.defend.isDown && this.player.body.touching.down) {
+                this.player.customState = 'DEFEND';
+                this.player.setVelocityX(0);
+                this.player.setTint(0x7f8c8d);
+                this.player.anims.play('idle', true);
+                return;
+            } else if (this.player.customState === 'DEFEND') {
+                this.player.customState = 'IDLE';
+                this.player.clearTint();
+            }
+
+            // 🌟 雙擊方向鍵衝刺邏輯
+            if (Phaser.Input.Keyboard.JustDown(this.cursors.right)) {
+                if (this.time.now - this.lastRightDownTime < this.doubleTapThreshold) {
+                    this.player.facing = 'right';
+                    this.player.setFlipX(false);
+                    this.performDash();
+                    return;
+                }
+                this.lastRightDownTime = this.time.now;
+            }
+
+            if (Phaser.Input.Keyboard.JustDown(this.cursors.left)) {
+                if (this.time.now - this.lastLeftDownTime < this.doubleTapThreshold) {
+                    this.player.facing = 'left';
+                    this.player.setFlipX(true);
+                    this.performDash();
+                    return;
+                }
+                this.lastLeftDownTime = this.time.now;
+            }
+
+            if (Phaser.Input.Keyboard.JustDown(this.keys.dash)) {
+                this.performDash();
+                return;
+            }
+
+            if (Phaser.Input.Keyboard.JustDown(this.keys.skill)) {
+                this.performSkill();
+                return;
+            }
+
+            if (Phaser.Input.Keyboard.JustDown(this.keys.attack)) {
+                this.performAttack();
+                return;
+            }
+
+            if (this.cursors.left.isDown) {
+                this.player.setVelocityX(-200);
+                this.player.facing = 'left';
+                this.player.customState = 'RUN';
+                this.player.setFlipX(true);
+                this.player.anims.play('run', true);
+            } else if (this.cursors.right.isDown) {
+                this.player.setVelocityX(200);
+                this.player.facing = 'right';
+                this.player.customState = 'RUN';
+                this.player.setFlipX(false);
+                this.player.anims.play('run', true);
+            } else {
+                this.player.setVelocityX(0);
+                this.player.customState = 'IDLE';
+                this.player.anims.play('idle', true);
+            }
+
+            if (this.keys.jump.isDown && this.player.body.touching.down) {
+                this.player.setVelocityY(-600);
+            }
+        }
+
+        performDash() {
+            this.player.customState = 'DASH';
+            
+            let dashSpeed = 700; 
+            this.player.setVelocityX(this.player.facing === 'right' ? dashSpeed : -dashSpeed);
+            
+            this.player.anims.play('run', true);
+
+            this.time.addEvent({
+                delay: 30,
+                repeat: 5,
+                callback: () => {
+                    let ghost = this.add.sprite(this.player.x, this.player.y, 'cao_cao', this.player.frame.name);
+                    ghost.setScale(this.player.scaleX);
+                    ghost.setFlipX(this.player.flipX);
+                    ghost.setTint(0x3498db);
+                    ghost.setAlpha(0.6);
+                    
+                    this.tweens.add({
+                        targets: ghost,
+                        alpha: 0,
+                        duration: 300,
+                        onComplete: () => { ghost.destroy(); }
+                    });
+                }
+            });
+
+            this.time.delayedCall(200, () => {
+                if (this.player.customState === 'DASH') {
+                    this.player.customState = 'IDLE';
+                    this.player.setVelocityX(0);
+                }
+            });
+        }
+
+        performAttack() {
+            this.player.customState = 'ATTACK';
+            this.player.setVelocityX(0); 
+            this.player.anims.play('attack', true);
+
+            this.time.delayedCall(150, () => {
+                this.attackHitbox.setVisible(true);
+                this.attackHitbox.body.setEnable(true);
+            });
+
+            this.player.once('animationcomplete-attack', () => {
+                this.attackHitbox.setVisible(false);
+                this.attackHitbox.body.setEnable(false);
+                this.player.customState = 'IDLE';
+            });
+        }
+
+        performSkill() {
+            this.player.customState = 'ATTACK';
+            this.player.setVelocityX(0); 
+            this.player.anims.play('attack', true);
+
+            this.time.delayedCall(150, () => {
+                let xOffset = this.player.facing === 'right' ? 60 : -60;
+                let velocityX = this.player.facing === 'right' ? 500 : -500;
+
+                let aura = this.auras.create(this.player.x + xOffset, this.player.y, 'aura_tex');
+                aura.setVelocityX(velocityX);
+                
+                this.time.delayedCall(1500, () => {
+                    if (aura && aura.active) aura.destroy();
+                });
+            });
+
+            this.player.once('animationcomplete-attack', () => {
+                this.player.customState = 'IDLE';
+            });
+        }
+
+        updateHitboxPosition() {
+            let offset = 60;
+            if (this.player.facing === 'right') {
+                this.attackHitbox.setPosition(this.player.x + offset, this.player.y);
+            } else {
+                this.attackHitbox.setPosition(this.player.x - offset, this.player.y);
+            }
+        }
+
+        handleMeleeHit(hitbox, enemy) {
+            this.applyDamageToEnemy(enemy, 20, 300, 1);
+        }
+
+        handleAuraHit(obj1, obj2) {
+            let aura = (obj1.texture.key === 'aura_tex') ? obj1 : obj2;
+            let enemy = (obj1.texture.key === 'aura_tex') ? obj2 : obj1;
+
+            if (aura && aura.active) {
+                aura.destroy(); 
+            }
+            this.applyDamageToEnemy(enemy, 30, 500, 1.2); 
+        }
+
+        applyDamageToEnemy(enemy, damage, knockbackSpeedX, knockbackMultiplierY) {
+            if (enemy.customState === 'HURT' || enemy.hp <= 0) return;
+
+            enemy.customState = 'HURT';
+            enemy.hp -= damage;
+            this.enemyHpText.setText('HP: ' + enemy.hp);
+
+            let knockbackDir = this.player.facing === 'right' ? 1 : -1;
+            enemy.setVelocityX(knockbackDir * knockbackSpeedX);
+            enemy.setVelocityY(-400 * knockbackMultiplierY); 
+            
+            enemy.setTint(0xffffff);
+
+            if (enemy.hp <= 0) {
+                this.time.delayedCall(300, () => {
+                    enemy.setTint(0x555555);
+                    enemy.setAngle(90 * knockbackDir);
+                    enemy.setVelocityX(0); 
+                    this.enemyHpText.setVisible(false);
+                    this.showBubble("✨ 化為齏粉吧！"); 
+                });
+            } else {
+                this.time.delayedCall(400, () => {
+                    enemy.clearTint();
+                    enemy.customState = 'IDLE';
+                });
+            }
+        }
+
+        updateBubblePosition() {
+            this.bubbleContainer.setPosition(this.player.x, this.player.y - 120);
+        }
+
+        showBubble(text) {
+            this.bubbleText.setText(text);
+            const bounds = this.bubbleText.getBounds();
+            const paddingX = 15;
+            const paddingY = 10;
+            
+            this.bubbleBg.clear();
+            this.bubbleBg.fillStyle(0xffffff, 0.95);
+            this.bubbleBg.fillRoundedRect(bounds.x - paddingX, bounds.y - paddingY, bounds.width + paddingX * 2, bounds.height + paddingY * 2, 10);
+            this.bubbleBg.lineStyle(3, 0xf39c12, 1);
+            this.bubbleBg.strokeRoundedRect(bounds.x - paddingX, bounds.y - paddingY, bounds.width + paddingX * 2, bounds.height + paddingY * 2, 10);
+            this.bubbleBg.fillStyle(0xffffff, 0.95);
+            this.bubbleBg.fillTriangle(0, bounds.bottom + paddingY - 2, -8, bounds.bottom + paddingY + 8, 8, bounds.bottom + paddingY + 8);
+            
+            this.bubbleContainer.setVisible(true);
+        }
+
+        async triggerGeminiTaunt() {
+            if (this.isTaunting) return; 
+            this.isTaunting = true;
+
+            this.showBubble("✨ 沉思中...");
+
+            let stateDesc = "站立不動，俯視群雄";
+            if (this.player.customState === 'RUN') stateDesc = "正在率軍衝鋒奔跑";
+            if (this.player.customState === 'ATTACK') stateDesc = "正在揮劍發動猛烈攻擊";
+            if (this.player.customState === 'DEFEND') stateDesc = "正在進行防禦";
+            if (this.player.customState === 'DASH') stateDesc = "正在以迅雷不及掩耳之勢突進衝刺";
+            if (!this.player.body.touching.down) stateDesc = "正在空中跳躍";
+
+            const prompt = `你現在是《三國演義》中的魏武帝曹操。請根據你目前的狀態：「${stateDesc}」，說出一句符合你霸道、奸雄性格的簡短台詞（必須限制在 12 個中文字以內，繁體中文）。直接輸出台詞，不要加上任何標點符號或引號。`;
+
+            const result = await callGeminiAPI(prompt);
+
+            this.showBubble(`✨ ${result}`);
+
+            this.time.delayedCall(3000, () => {
+                this.bubbleContainer.setVisible(false);
+                this.isTaunting = false;
+            });
+        }
+    }
+
+    // 🌟 將遊戲初始化包裝在 window.onload 中，確保外部 Phaser 腳本加載完成
+    window.onload = function() {
+        const config = {
+            type: Phaser.AUTO,
+            width: 800,
+            height: 600,
+            parent: 'game-container',
+            physics: {
+                default: 'arcade',
+                arcade: { gravity: { y: 1200 }, debug: true }
+            },
+            scene: MainScene
+        };
+
+        const game = new Phaser.Game(config);
+    };
+</script>
+
+</body>
+</html>
